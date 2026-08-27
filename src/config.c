@@ -1,6 +1,15 @@
 #include "launcher.h"
 #include <glib/gstdio.h>
 
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+
+/* 密码密文字段前缀：enc:v1:<base64(iv|tag|ciphertext)> */
+#define PASS_PREFIX "enc:v1:"
+#define KEY_LEN 32
+#define IV_LEN 12
+#define TAG_LEN 16
+
 /* 配置文件位置：~/.config/xfreerdp-launcher/config.ini */
 static gchar* config_path(void)
 {
@@ -10,6 +19,159 @@ static gchar* config_path(void)
 	gchar* path = g_build_filename(dir, "config.ini", NULL);
 	g_free(dir);
 	return path;
+}
+
+/* 密钥文件位置：~/.config/xfreerdp-launcher/secret.key（权限 0600） */
+static gchar* secret_key_path(void)
+{
+	const gchar* base = g_get_user_config_dir();
+	gchar* dir = g_build_filename(base, "xfreerdp-launcher", NULL);
+	g_mkdir_with_parents(dir, 0700);
+	gchar* path = g_build_filename(dir, "secret.key", NULL);
+	g_free(dir);
+	return path;
+}
+
+/* 读取密钥；若不存在或长度不符则生成新的随机密钥并落盘（0600）。 */
+static gboolean secret_key_obtain(guchar key[KEY_LEN])
+{
+	gchar* path = secret_key_path();
+	gsize len = 0;
+	gchar* raw = NULL;
+	gboolean ok = FALSE;
+
+	if (g_file_get_contents(path, &raw, &len, NULL) && len == KEY_LEN)
+	{
+		memcpy(key, raw, KEY_LEN);
+		ok = TRUE;
+	}
+	else
+	{
+		if (RAND_bytes(key, KEY_LEN) == 1)
+		{
+			if (g_file_set_contents(path, (const gchar*)key, KEY_LEN, NULL))
+			{
+				g_chmod(path, 0600);
+				ok = TRUE;
+			}
+		}
+	}
+
+	g_free(raw);
+	g_free(path);
+	return ok;
+}
+
+/* 加密明文密码，返回 "enc:v1:<base64>" 形式的新字符串；失败回退为明文字符串。
+ * 空密码返回空串。 */
+static gchar* password_encrypt(const gchar* plain)
+{
+	if (!plain || !*plain)
+		return g_strdup("");
+
+	guchar key[KEY_LEN];
+	if (!secret_key_obtain(key))
+		return g_strdup(plain);
+
+	guchar iv[IV_LEN];
+	if (RAND_bytes(iv, IV_LEN) != 1)
+		return g_strdup(plain);
+
+	GByteArray* out = g_byte_array_new();
+	g_byte_array_append(out, iv, IV_LEN); /* 前 12 字节 IV */
+
+	gsize pt_len = strlen(plain);
+	guchar* ct = g_malloc(pt_len); /* GCM 密文与明文等长 */
+
+	EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+	gboolean ok = FALSE;
+	if (ctx)
+	{
+		int len = 0, fin = 0;
+		if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) == 1 &&
+		    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, IV_LEN, NULL) == 1 &&
+		    EVP_EncryptInit_ex(ctx, NULL, NULL, key, iv) == 1 &&
+		    EVP_EncryptUpdate(ctx, ct, &len, (const guchar*)plain, (int)pt_len) == 1 &&
+		    EVP_EncryptFinal_ex(ctx, ct + len, &fin) == 1)
+		{
+			g_byte_array_append(out, ct, len + fin);
+			guchar tag[TAG_LEN];
+			if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, TAG_LEN, tag) == 1)
+			{
+				g_byte_array_append(out, tag, TAG_LEN); /* 末尾 16 字节 tag */
+				ok = TRUE;
+			}
+		}
+		EVP_CIPHER_CTX_free(ctx);
+	}
+	g_free(ct);
+
+	gchar* result = NULL;
+	if (ok)
+	{
+		gchar* b64 = g_base64_encode(out->data, out->len);
+		result = g_strconcat(PASS_PREFIX, b64, NULL);
+		g_free(b64);
+	}
+	else
+		result = g_strdup(plain);
+	g_byte_array_free(out, TRUE);
+	return result;
+}
+
+/* 解密密码字段：带 enc:v1: 前缀则解密，否则视为旧明文直接返回。
+ * 解密失败返回 NULL（视为无密码）。 */
+static gchar* password_decrypt(const gchar* stored)
+{
+	if (!stored || !*stored)
+		return g_strdup("");
+
+	if (!g_str_has_prefix(stored, PASS_PREFIX))
+		return g_strdup(stored); /* 旧明文，向后兼容 */
+
+	gsize b64_len = 0;
+	guchar* raw = g_base64_decode(stored + strlen(PASS_PREFIX), &b64_len);
+	if (!raw || b64_len < IV_LEN + TAG_LEN)
+	{
+		g_free(raw);
+		return NULL;
+	}
+
+	guchar key[KEY_LEN];
+	if (!secret_key_obtain(key))
+	{
+		g_free(raw);
+		return NULL;
+	}
+
+	const guchar* iv = raw;
+	const guchar* tag = raw + b64_len - TAG_LEN;
+	const guchar* ct = raw + IV_LEN;
+	int ct_len = (int)(b64_len - IV_LEN - TAG_LEN);
+
+	guchar* pt = g_malloc((size_t)(ct_len > 0 ? ct_len : 1) + 1);
+	gchar* result = NULL;
+
+	EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+	if (ctx)
+	{
+		int len = 0, fin = 0;
+		if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) == 1 &&
+		    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, IV_LEN, NULL) == 1 &&
+		    EVP_DecryptInit_ex(ctx, NULL, NULL, key, iv) == 1 &&
+		    EVP_DecryptUpdate(ctx, pt, &len, ct, ct_len) == 1 &&
+		    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, TAG_LEN, (void*)tag) == 1 &&
+		    EVP_DecryptFinal_ex(ctx, pt + len, &fin) == 1)
+		{
+			pt[len + fin] = '\0';
+			result = g_strdup((gchar*)pt);
+		}
+		EVP_CIPHER_CTX_free(ctx);
+	}
+
+	g_free(pt);
+	g_free(raw);
+	return result;
 }
 
 Config* config_load(void)
@@ -28,7 +190,12 @@ Config* config_load(void)
 				continue;
 
 			Conn* c = conn_new();
-			c->name = g_strdup(groups[i] + 5);
+			/* 新格式 section 键为 conn:host|port|protocol，name 独立存于 "name" 字段；
+			 * 旧格式 section 键为 conn:名称（无 "name" 字段），做向后兼容。 */
+			if (g_key_file_has_key(kf, groups[i], "name", NULL))
+				c->name = g_key_file_get_string(kf, groups[i], "name", NULL);
+			else
+				c->name = g_strdup(groups[i] + 5);
 			c->host = g_key_file_get_string(kf, groups[i], "host", NULL);
 			if (!c->host || !*c->host)
 			{
@@ -42,7 +209,11 @@ Config* config_load(void)
 					c->protocol = PROTO_SPICE;
 			}
 			c->username = g_key_file_get_string(kf, groups[i], "username", NULL);
-			c->password = g_key_file_get_string(kf, groups[i], "password", NULL);
+			{
+				gchar* stored_pass = g_key_file_get_string(kf, groups[i], "password", NULL);
+				c->password = password_decrypt(stored_pass);
+				g_free(stored_pass);
+			}
 			c->width = g_key_file_get_integer(kf, groups[i], "width", NULL);
 			c->height = g_key_file_get_integer(kf, groups[i], "height", NULL);
 			c->fullscreen = g_key_file_get_boolean(kf, groups[i], "fullscreen", NULL);
@@ -68,12 +239,20 @@ gboolean config_save(Config* cfg, GError** err)
 	for (guint i = 0; i < cfg->conns->len; i++)
 	{
 		Conn* c = g_ptr_array_index(cfg->conns, i);
-		gchar* group = g_strdup_printf("conn:%s", c->name ? c->name : "");
+		/* 用 host|port|protocol 作为唯一 section 键，避免同名连接互相覆盖 */
+		gchar* group = g_strdup_printf("conn:%s|%d|%s",
+		                               c->host ? c->host : "", c->port,
+		                               c->protocol == PROTO_SPICE ? "spice" : "rdp");
+		g_key_file_set_string(kf, group, "name", c->name ? c->name : "");
 		g_key_file_set_string(kf, group, "host", c->host ? c->host : "");
 		g_key_file_set_integer(kf, group, "port", c->port);
 		g_key_file_set_string(kf, group, "protocol", c->protocol == PROTO_SPICE ? "spice" : "rdp");
 		g_key_file_set_string(kf, group, "username", c->username ? c->username : "");
-		g_key_file_set_string(kf, group, "password", c->password ? c->password : "");
+		{
+			gchar* enc_pass = password_encrypt(c->password);
+			g_key_file_set_string(kf, group, "password", enc_pass ? enc_pass : "");
+			g_free(enc_pass);
+		}
 		g_key_file_set_integer(kf, group, "width", c->width);
 		g_key_file_set_integer(kf, group, "height", c->height);
 		g_key_file_set_boolean(kf, group, "fullscreen", c->fullscreen);

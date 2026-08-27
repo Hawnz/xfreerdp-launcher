@@ -7,6 +7,7 @@
 #include <signal.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 #include <gtk/gtk.h>
 
@@ -21,6 +22,7 @@ static const gchar* CSS_DATA =
     "  box-shadow: 0 1px 3px alpha(#000, 0.12);"
     "  min-width: 210px;"
     "  min-height: 100px;"
+    "  cursor: pointer;"
     "}"
     ".conn-card:hover {"
     "  background-color: alpha(@theme_selected_bg_color, 0.08);"
@@ -42,14 +44,16 @@ static const gchar* CSS_DATA =
     "}"
     ".conn-name { font-size: 14px; font-weight: bold; }"
     ".conn-sub { font-size: 12px; opacity: 0.65; }"
-    ".group-pill { font-size: 11px; opacity: 0.7; }"
+    ".group-pill { font-size: 11px; opacity: 0.75; padding: 1px 8px; border-radius: 999px;"
+    "  border: 1px solid alpha(@theme_fg_color, 0.25); background-color: alpha(@theme_fg_color, 0.06); }"
     ".star { color: #ffb400; }"
     ".star-empty { color: alpha(@theme_fg_color, 0.75); }"
     ".proto-pill { font-size: 10px; font-weight: bold; padding: 1px 8px; border-radius: 999px; }"
-    ".proto-rdp { color: #ffffff; background-color: #2f81f7; }"
-    ".proto-spice { color: #ffffff; background-color: #c9641d; }"
+    ".proto-rdp { color: @theme_selected_fg_color; background-color: @theme_selected_bg_color; }"
+    ".proto-spice { color: #ffffff; background-color: alpha(#c9641d, 0.88); }"
     ".filter-bar { padding: 8px 14px 2px 14px; }"
     ".chip { border-radius: 999px; padding: 2px 14px; margin: 2px 4px; }"
+    ".chip:hover { background-color: alpha(@theme_selected_bg_color, 0.10); }"
     ".chip:checked { background-color: @theme_selected_bg_color; color: @theme_selected_fg_color; }"
     ".chip radio,"
     ".chip radio:checked,"
@@ -62,7 +66,8 @@ static const gchar* CSS_DATA =
     ".log-view { font-family: 'DejaVu Sans Mono', monospace; font-size: 12px; }"
     ".section-title { font-weight: bold; opacity: 0.7; padding: 10px 14px 4px 14px; }"
     ".placeholder { opacity: 0.55; }"
-    ".statusbar { padding: 4px 10px; border-top: 1px solid alpha(#000, 0.1); }"
+    ".statusbar { padding: 4px 12px; border-top: 1px solid alpha(#000, 0.12);"
+    "  background-color: alpha(@theme_fg_color, 0.05); }"
     ".conn-dialog entry { border-radius: 6px; padding: 4px 8px; min-width: 300px; }"
     ".conn-dialog .field-label { font-weight: 600; opacity: 0.7; }";
 
@@ -122,13 +127,28 @@ static GtkWidget* btn_icon(const gchar* label, const gchar* icon)
 	return b;
 }
 
+/* 日志缓冲上限（字符数），超出后从头部裁剪，防止长时间运行内存无限增长 */
+#define LOG_MAX_CHARS (200 * 1024)
+
 static void log_append(Launcher* self, const gchar* text)
 {
 	GtkTextBuffer* buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(self->log_view));
 	GtkTextIter end;
 	gtk_text_buffer_get_end_iter(buf, &end);
 	gtk_text_buffer_insert(buf, &end, text, -1);
+
+	/* 限制长度：超过上限时删除最早的部分 */
+	gint total = gtk_text_buffer_get_char_count(buf);
+	if (total > LOG_MAX_CHARS)
+	{
+		GtkTextIter start, cut;
+		gtk_text_buffer_get_start_iter(buf, &start);
+		gtk_text_buffer_get_iter_at_offset(buf, &cut, total - LOG_MAX_CHARS);
+		gtk_text_buffer_delete(buf, &start, &cut);
+	}
+
 	/* 滚动到底部 */
+	gtk_text_buffer_get_end_iter(buf, &end);
 	GtkTextMark* mark = gtk_text_buffer_create_mark(buf, NULL, &end, FALSE);
 	gtk_text_view_scroll_to_mark(GTK_TEXT_VIEW(self->log_view), mark, 0.0, FALSE, 0.0, 0.0);
 	gtk_text_buffer_delete_mark(buf, mark);
@@ -200,9 +220,14 @@ static void on_child_exit(GPid pid, gint status, gpointer data)
 
 	gtk_widget_set_sensitive(self->connect_btn, TRUE);
 	gtk_widget_set_sensitive(self->disconnect_btn, FALSE);
-	gtk_label_set_text(GTK_LABEL(self->status), "已断开");
 
-	gchar* msg = g_strdup_printf("\n[进程退出，状态码 %d]\n", status);
+	/* 区分正常退出与异常退出，给出更明确的状态提示 */
+	gboolean ok_exit = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+	gtk_label_set_text(GTK_LABEL(self->status), ok_exit ? "已断开" : "连接异常结束");
+
+	gchar* msg = ok_exit
+	                 ? g_strdup("\n[已正常退出]\n")
+	                 : g_strdup_printf("\n[异常退出，状态码 %d]\n", status);
 	log_append(self, msg);
 	g_free(msg);
 }
@@ -394,7 +419,12 @@ static void connect_conn(Launcher* self, Conn* c)
 	self->child_running = TRUE;
 	gtk_widget_set_sensitive(self->connect_btn, FALSE);
 	gtk_widget_set_sensitive(self->disconnect_btn, TRUE);
-	gtk_label_set_text(GTK_LABEL(self->status), "连接中…");
+	{
+		gchar* st = g_strdup_printf("连接中：%s:%d（%s）", c->host, c->port,
+		                           c->protocol == PROTO_SPICE ? "SPICE" : "RDP");
+		gtk_label_set_text(GTK_LABEL(self->status), st);
+		g_free(st);
+	}
 	gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(self->log_toggle), TRUE); /* 自动展开日志 */
 
 	gchar* msg = g_strdup_printf("正在连接 %s:%d ...\n$ %s\n", c->host, c->port, masked);
@@ -541,10 +571,17 @@ static gboolean conn_match_filter(Launcher* self, Conn* c)
 		gchar* ql = g_utf8_strdown(q, -1);
 		gchar* nl = g_utf8_strdown(c->name ? c->name : "", -1);
 		gchar* hl = g_utf8_strdown(c->host ? c->host : "", -1);
-		gboolean hit = strstr(nl, ql) != NULL || strstr(hl, ql) != NULL;
+		gchar* ul = g_utf8_strdown(c->username ? c->username : "", -1);
+		gchar* gl = g_utf8_strdown(c->group ? c->group : "", -1);
+		const gchar* proto = (c->protocol == PROTO_SPICE) ? "spice" : "rdp";
+		gboolean hit = strstr(nl, ql) != NULL || strstr(hl, ql) != NULL ||
+		               strstr(ul, ql) != NULL || strstr(gl, ql) != NULL ||
+		               strstr(proto, ql) != NULL;
 		g_free(ql);
 		g_free(nl);
 		g_free(hl);
+		g_free(ul);
+		g_free(gl);
 		if (!hit)
 			return FALSE;
 	}
@@ -710,15 +747,6 @@ static void on_card_selected(GtkFlowBox* fb, gpointer data)
 		gtk_style_context_add_class(gtk_widget_get_style_context(card), "card-selected");
 		g_list_free(sel);
 	}
-}
-
-static void on_card_activated(GtkFlowBox* fb, GtkFlowBoxChild* child, gpointer data)
-{
-	(void)fb;
-	Launcher* self = data;
-	Conn* c = g_object_get_data(G_OBJECT(child), "conn");
-	if (c)
-		connect_conn(self, c);
 }
 
 /* ---------------- 新建/编辑连接对话框 ---------------- */
@@ -1015,14 +1043,13 @@ static void menu_info(GtkMenuItem* mi, gpointer d)
 	else
 		size = g_strdup("默认");
 	gchar* body = g_strdup_printf(
-	    "名称：%s\n主机：%s:%d\n用户名：%s\n窗口：%s\nGFX：%s\n剪贴板：%s\n"
+	    "名称：%s\n协议：%s\n主机：%s:%d\n用户名：%s\n窗口：%s\n"
 	    "分组：%s\n收藏：%s\n额外参数：%s",
 	    c->name && *c->name ? c->name : c->host,
+	    c->protocol == PROTO_SPICE ? "SPICE" : "RDP",
 	    c->host, c->port,
 	    c->username && *c->username ? c->username : "（未设置）",
 	    size,
-	    c->gfx ? "开" : "关",
-	    c->clipboard ? "开" : "关",
 	    c->group && *c->group ? c->group : "（未分组）",
 	    c->favorite ? "是" : "否",
 	    c->extra && *c->extra ? c->extra : "（无）");
@@ -1036,11 +1063,35 @@ static void menu_info(GtkMenuItem* mi, gpointer d)
 
 static gboolean on_card_button_press(GtkWidget* evbox, GdkEventButton* ev, gpointer data)
 {
-	if (ev->button != 3)
-		return FALSE;
 	Launcher* self = data;
 	Conn* c = g_object_get_data(G_OBJECT(evbox), "conn");
 	GtkFlowBoxChild* child = (GtkFlowBoxChild*)gtk_widget_get_parent(evbox);
+
+	/* 左键：单击选中卡片，再次点击已选中的卡片才连接 */
+	if (ev->button == 1)
+	{
+		GList* sel = gtk_flow_box_get_selected_children(GTK_FLOW_BOX(self->flow));
+		gboolean already_selected = FALSE;
+		for (GList* it = sel; it; it = it->next)
+		{
+			if (it->data == (gpointer)child)
+			{
+				already_selected = TRUE;
+				break;
+			}
+		}
+		g_list_free(sel);
+
+		if (already_selected && c)
+		{
+			connect_conn(self, c);
+			return TRUE;
+		}
+		return FALSE; /* 未选中：交回 FlowBox 完成选中 */
+	}
+
+	if (ev->button != 3)
+		return FALSE;
 	if (child)
 		gtk_flow_box_select_child(GTK_FLOW_BOX(self->flow), child);
 	if (!c)
@@ -1154,6 +1205,9 @@ static void on_activate(GtkApplication* app, gpointer data)
 	self->connect_btn = btn_icon("连接", "media-playback-start");
 	self->disconnect_btn = btn_icon("断开", "process-stop");
 	self->log_toggle = gtk_toggle_button_new_with_label("日志");
+	gtk_button_set_image(GTK_BUTTON(self->log_toggle),
+	                     gtk_image_new_from_icon_name("utilities-system-monitor", GTK_ICON_SIZE_BUTTON));
+	gtk_button_set_always_show_image(GTK_BUTTON(self->log_toggle), TRUE);
 	gtk_widget_set_sensitive(self->disconnect_btn, FALSE);
 
 	/* 搜索框（HeaderBar 内） */
@@ -1192,7 +1246,7 @@ static void on_activate(GtkApplication* app, gpointer data)
 	gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(grid_scroll), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
 	self->flow = gtk_flow_box_new();
 	gtk_flow_box_set_selection_mode(GTK_FLOW_BOX(self->flow), GTK_SELECTION_SINGLE);
-	gtk_flow_box_set_homogeneous(GTK_FLOW_BOX(self->flow), FALSE);
+	gtk_flow_box_set_homogeneous(GTK_FLOW_BOX(self->flow), TRUE);
 	gtk_flow_box_set_min_children_per_line(GTK_FLOW_BOX(self->flow), 2);
 	gtk_flow_box_set_max_children_per_line(GTK_FLOW_BOX(self->flow), 6);
 	gtk_flow_box_set_column_spacing(GTK_FLOW_BOX(self->flow), 12);
@@ -1207,7 +1261,7 @@ static void on_activate(GtkApplication* app, gpointer data)
 	gtk_widget_set_valign(empty_box, GTK_ALIGN_CENTER);
 	gtk_widget_set_halign(empty_box, GTK_ALIGN_CENTER);
 	gtk_box_pack_start(GTK_BOX(empty_box),
-	                   gtk_image_new_from_icon_name("network-workgroup", GTK_ICON_SIZE_DIALOG),
+	                   gtk_image_new_from_icon_name("computer", GTK_ICON_SIZE_DIALOG),
 	                   FALSE, FALSE, 0);
 	GtkWidget* empty_label = gtk_label_new("暂无连接\n点击左上角「新建」添加");
 	gtk_label_set_justify(GTK_LABEL(empty_label), GTK_JUSTIFY_CENTER);
@@ -1262,7 +1316,6 @@ static void on_activate(GtkApplication* app, gpointer data)
 	gtk_style_context_add_class(gtk_widget_get_style_context(self->status), "statusbar");
 	gtk_box_pack_start(GTK_BOX(main_box), self->status, FALSE, FALSE, 0);
 
-	g_signal_connect(self->flow, "child-activated", G_CALLBACK(on_card_activated), self);
 	g_signal_connect(self->flow, "selected-children-changed", G_CALLBACK(on_card_selected), self);
 	g_signal_connect(win, "destroy", G_CALLBACK(on_window_destroy), self);
 
