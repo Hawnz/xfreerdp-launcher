@@ -38,6 +38,8 @@ sudo apt install build-essential pkg-config libgtk-3-dev libssl-dev freerdp2-x11
 
 ## 3. 构建与运行
 
+### Linux
+
 ```bash
 cd xfreerdp-launcher
 make            # 编译生成 ./xfreerdp-launcher
@@ -46,6 +48,31 @@ make clean      # 清理产物
 
 ./xfreerdp-launcher
 ```
+
+### Windows 10（MSYS2）
+
+代码已做 POSIX/Windows 跨平台适配（stdin 空设备重定向、进程终止、退出码解析、
+I/O channel），可直接在 MSYS2 下编译为原生 Windows 可执行文件。
+
+1. 安装 [MSYS2](https://www.msys2.org/) 后，打开 **MINGW64** 或 **UCRT64** 终端
+2. 进入源码目录，执行：
+
+```bash
+pacman -S --needed --noconfirm make mingw-w64-x86_64-gcc mingw-w64-x86_64-pkg-config \
+    mingw-w64-x86_64-gtk3 mingw-w64-x86_64-openssl \
+    mingw-w64-x86_64-freerdp mingw-w64-x86_64-virt-viewer
+
+make clean
+make
+```
+
+产物为 `xfreerdp-launcher.exe`（MINGW64 终端下）。也可直接运行
+[build-msys2.sh](file:///home/acha/Desktop/freerdp-2.11.8/xfreerdp-launcher/build-msys2.sh)，
+它会按当前 `MSYSTEM` 自动选择包名前缀并完成上述步骤。
+
+> 注意：`mingw-w64-*` 前缀需与所选终端一致（MINGW64 → `mingw-w64-x86_64`、
+> UCRT64 → `mingw-w64-ucrt-x86_64`）。分发单文件可执行程序时，需附带其依赖的
+> GTK3/OpenSSL 运行库 DLL（可用 `ldd xfreerdp-launcher.exe` 查看）。
 
 ### 环境变量覆盖客户端路径
 

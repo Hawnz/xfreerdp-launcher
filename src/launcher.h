@@ -32,6 +32,9 @@ typedef struct Conn
 typedef struct Config
 {
 	GPtrArray* conns;  /* Conn* 列表 */
+	gchar* rdp_bin;    /* xfreerdp 路径（可空，默认 "xfreerdp"） */
+	gchar* spice_bin;  /* remote-viewer 路径（可空，默认 "remote-viewer"） */
+	gchar* spice_prefix; /* SPICE 协议前缀（可空，默认 "spice"） */
 } Config;
 
 Config* config_load(void);
@@ -42,6 +45,6 @@ void conn_free(Conn* c);
 void config_free(Config* cfg);
 
 /* 构造连接命令行参数数组（RDP 用 xfreerdp，SPICE 用 remote-viewer），返回后需 g_strfreev 释放 */
-gchar** conn_build_argv(Conn* c, const gchar* binary);
+gchar** conn_build_argv(Conn* c, const gchar* binary, const gchar* spice_prefix);
 
 #endif /* XFREERDP_LAUNCHER_H */

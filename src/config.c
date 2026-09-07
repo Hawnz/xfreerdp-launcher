@@ -183,6 +183,11 @@ Config* config_load(void)
 	GKeyFile* kf = g_key_file_new();
 	if (g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL))
 	{
+		/* 读取全局设置 */
+		cfg->rdp_bin = g_key_file_get_string(kf, "settings", "rdp_bin", NULL);
+		cfg->spice_bin = g_key_file_get_string(kf, "settings", "spice_bin", NULL);
+		cfg->spice_prefix = g_key_file_get_string(kf, "settings", "spice_prefix", NULL);
+
 		gchar** groups = g_key_file_get_groups(kf, NULL);
 		for (gint i = 0; groups && groups[i]; i++)
 		{
@@ -264,6 +269,14 @@ gboolean config_save(Config* cfg, GError** err)
 		g_free(group);
 	}
 
+	/* 写入全局设置 */
+	if (cfg->rdp_bin && *cfg->rdp_bin)
+		g_key_file_set_string(kf, "settings", "rdp_bin", cfg->rdp_bin);
+	if (cfg->spice_bin && *cfg->spice_bin)
+		g_key_file_set_string(kf, "settings", "spice_bin", cfg->spice_bin);
+	if (cfg->spice_prefix && *cfg->spice_prefix)
+		g_key_file_set_string(kf, "settings", "spice_prefix", cfg->spice_prefix);
+
 	gchar* path = config_path();
 	gchar* data = g_key_file_to_data(kf, NULL, NULL);
 	gboolean ok = g_file_set_contents(path, data, -1, err);
@@ -299,21 +312,25 @@ void config_free(Config* cfg)
 	if (!cfg)
 		return;
 	g_ptr_array_free(cfg->conns, TRUE);
+	g_free(cfg->rdp_bin);
+	g_free(cfg->spice_bin);
+	g_free(cfg->spice_prefix);
 	g_free(cfg);
 }
 
 /* 构造连接命令行参数数组 */
-gchar** conn_build_argv(Conn* c, const gchar* binary)
+gchar** conn_build_argv(Conn* c, const gchar* binary, const gchar* spice_prefix)
 {
 	GPtrArray* a = g_ptr_array_new();
+	const gchar* prefix = spice_prefix && *spice_prefix ? spice_prefix : "spice";
 
 	if (c->protocol == PROTO_SPICE)
 	{
-		/* SPICE：remote-viewer spice://host:port[?password=xxx] [-f] [extra] */
+		/* SPICE：remote-viewer <prefix>://host:port[?password=xxx] [-f] [extra] */
 		g_ptr_array_add(a, g_strdup(binary));
 		gchar* uri = (c->password && *c->password)
-		                 ? g_strdup_printf("spice://%s:%d?password=%s", c->host, c->port, c->password)
-		                 : g_strdup_printf("spice://%s:%d", c->host, c->port);
+		                 ? g_strdup_printf("%s://%s:%d?password=%s", prefix, c->host, c->port, c->password)
+		                 : g_strdup_printf("%s://%s:%d", prefix, c->host, c->port);
 		g_ptr_array_add(a, uri);
 		if (c->fullscreen)
 			g_ptr_array_add(a, g_strdup("-f"));

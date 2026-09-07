@@ -3,11 +3,18 @@
  *   卡片网格主页 + 右键菜单 + 收藏/分组筛选 + 搜索框 + 可折叠日志
  * 直接调用系统 PATH 中的 xfreerdp（可用环境变量 XFREERDP_BIN 覆盖）
  */
+#include <string.h>
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <signal.h>
-#include <string.h>
-#include <unistd.h>
 #include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #include <gtk/gtk.h>
 
@@ -82,6 +89,7 @@ typedef struct Launcher
 	GtkWidget* left_stack;   /* 网格/空状态/无匹配 切换 */
 	GtkWidget* filter_bar;   /* 全部/收藏/分组 chips */
 	GtkWidget* search;       /* GtkSearchEntry */
+	GtkWidget* search_btn;   /* 搜索图标按钮（点击展开为搜索框） */
 	GtkWidget* log_revealer; /* 可折叠日志 */
 	GtkWidget* log_view;     /* GtkTextView */
 	GtkWidget* log_toggle;
@@ -205,6 +213,18 @@ static void child_cleanup(Launcher* self)
 	}
 }
 
+/* 终止子进程：POSIX 发 SIGTERM，Windows 调 TerminateProcess。 */
+static void terminate_child(GPid pid)
+{
+	if (!pid)
+		return;
+#ifdef _WIN32
+	TerminateProcess((HANDLE)pid, 1);
+#else
+	kill(pid, SIGTERM);
+#endif
+}
+
 static void on_child_exit(GPid pid, gint status, gpointer data)
 {
 	Launcher* self = data;
@@ -221,8 +241,13 @@ static void on_child_exit(GPid pid, gint status, gpointer data)
 	gtk_widget_set_sensitive(self->connect_btn, TRUE);
 	gtk_widget_set_sensitive(self->disconnect_btn, FALSE);
 
-	/* 区分正常退出与异常退出，给出更明确的状态提示 */
+	/* 区分正常退出与异常退出，给出更明确的状态提示。
+	 * POSIX 下 status 是 wait 状态需用宏解析；Windows 下 g_child_watch 直接给退出码。 */
+#ifdef _WIN32
+	gboolean ok_exit = (status == 0);
+#else
 	gboolean ok_exit = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+#endif
 	gtk_label_set_text(GTK_LABEL(self->status), ok_exit ? "已断开" : "连接异常结束");
 
 	gchar* msg = ok_exit
@@ -232,12 +257,21 @@ static void on_child_exit(GPid pid, gint status, gpointer data)
 	g_free(msg);
 }
 
-/* 子进程 setup 回调：把 xfreerdp 的 stdin 显式重定向到 /dev/null。
+/* 子进程 setup 回调：把 xfreerdp 的 stdin 显式重定向到空设备（/dev/null 或 NUL）。
  * 未配置密码时 xfreerdp 会从 stdin 交互式提示输入密码；读到 EOF 后立即以
  * “缺少凭据”失败退出，而不是挂起等待输入。 */
 static void child_setup_stdin_devnull(gpointer user_data)
 {
 	(void)user_data;
+#ifdef _WIN32
+	int fd = _open("NUL", _O_RDONLY);
+	if (fd >= 0)
+	{
+		_dup2(fd, 0); /* STDIN_FILENO == 0 */
+		if (fd != 0)
+			_close(fd);
+	}
+#else
 	int fd = open("/dev/null", O_RDONLY);
 	if (fd >= 0)
 	{
@@ -245,6 +279,7 @@ static void child_setup_stdin_devnull(gpointer user_data)
 		if (fd != STDIN_FILENO)
 			close(fd);
 	}
+#endif
 }
 
 /* 连接缺少密码（或用户名）时弹窗补录，不写入配置。
@@ -386,7 +421,7 @@ static void connect_conn(Launcher* self, Conn* c)
 
 	/* 按协议选择客户端：RDP 用 xfreerdp，SPICE 用 remote-viewer */
 	const gchar* bin = (tmp.protocol == PROTO_SPICE) ? self->spice_binary : self->binary;
-	gchar** argv = conn_build_argv(&tmp, bin);
+	gchar** argv = conn_build_argv(&tmp, bin, self->config->spice_prefix);
 	g_free(tmp_user);
 	g_free(tmp_pass);
 	gchar* cmdline = g_strjoinv(" ", argv);
@@ -433,8 +468,13 @@ static void connect_conn(Launcher* self, Conn* c)
 	g_free(cmdline);
 	g_free(masked);
 
+	#ifdef _WIN32
+	self->out_ch = g_io_channel_win32_new_fd(out_fd);
+	self->err_ch = g_io_channel_win32_new_fd(err_fd);
+#else
 	self->out_ch = g_io_channel_unix_new(out_fd);
 	self->err_ch = g_io_channel_unix_new(err_fd);
+#endif
 	g_io_channel_set_encoding(self->out_ch, NULL, NULL);
 	g_io_channel_set_encoding(self->err_ch, NULL, NULL);
 	self->out_watch = g_io_add_watch(self->out_ch, G_IO_IN | G_IO_HUP | G_IO_ERR, on_child_output, self);
@@ -469,8 +509,8 @@ static void on_disconnect(GtkButton* btn, gpointer data)
 	Launcher* self = data;
 	if (self->child_running)
 	{
-		kill(self->child_pid, SIGTERM);
-		log_append(self, "\n[已发送 SIGTERM]\n");
+		terminate_child(self->child_pid);
+		log_append(self, "\n[已发送终止信号]\n");
 		gtk_label_set_text(GTK_LABEL(self->status), "正在终止…");
 	}
 }
@@ -480,10 +520,28 @@ static void on_window_destroy(GtkWidget* widget, gpointer data)
 	(void)widget;
 	Launcher* self = data;
 	if (self->child_running)
-		kill(self->child_pid, SIGTERM);
+		terminate_child(self->child_pid);
 }
 
 /* ---------------- 卡片网格 ---------------- */
+
+/* 把分组字符串按逗号拆分，去首尾空白并忽略空项。
+ * 例如 "生产,  办公 ," → ["生产", "办公"]。返回需 g_ptr_array_unref。 */
+static GPtrArray* group_split(const gchar* group)
+{
+	GPtrArray* arr = g_ptr_array_new_with_free_func(g_free);
+	if (!group || !*group)
+		return arr;
+	gchar** parts = g_strsplit(group, ",", -1);
+	for (gint i = 0; parts && parts[i]; i++)
+	{
+		gchar* t = g_strstrip(parts[i]);
+		if (*t)
+			g_ptr_array_add(arr, g_strdup(t));
+	}
+	g_strfreev(parts);
+	return arr;
+}
 
 static GtkWidget* card_new(Launcher* self, Conn* c)
 {
@@ -537,19 +595,29 @@ static GtkWidget* card_new(Launcher* self, Conn* c)
 	GtkWidget* sub = gtk_label_new(sub_txt);
 	g_free(sub_txt);
 	gtk_label_set_xalign(GTK_LABEL(sub), 0.0);
+	gtk_label_set_ellipsize(GTK_LABEL(sub), PANGO_ELLIPSIZE_END);
 	gtk_widget_set_halign(sub, GTK_ALIGN_START);
+	gtk_widget_set_hexpand(sub, TRUE);
 	gtk_style_context_add_class(gtk_widget_get_style_context(sub), "conn-sub");
 	gtk_box_pack_start(GTK_BOX(vbox), sub, FALSE, FALSE, 0);
 
-	/* 分组标签 */
-	if (c->group && *c->group)
+	/* 分组标签（支持逗号分隔的多分组，横向排列） */
+	GPtrArray* gs = group_split(c->group);
+	if (gs->len > 0)
 	{
-		GtkWidget* gp = gtk_label_new(c->group);
-		gtk_label_set_xalign(GTK_LABEL(gp), 0.0);
-		gtk_widget_set_halign(gp, GTK_ALIGN_START);
-		gtk_style_context_add_class(gtk_widget_get_style_context(gp), "group-pill");
-		gtk_box_pack_start(GTK_BOX(vbox), gp, FALSE, FALSE, 0);
+		GtkWidget* gbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+		gtk_widget_set_halign(gbox, GTK_ALIGN_START);
+		for (guint k = 0; k < gs->len; k++)
+		{
+			GtkWidget* gp = gtk_label_new(g_ptr_array_index(gs, k));
+			gtk_label_set_xalign(GTK_LABEL(gp), 0.0);
+			gtk_label_set_ellipsize(GTK_LABEL(gp), PANGO_ELLIPSIZE_END);
+			gtk_style_context_add_class(gtk_widget_get_style_context(gp), "group-pill");
+			gtk_box_pack_start(GTK_BOX(gbox), gp, FALSE, FALSE, 0);
+		}
+		gtk_box_pack_start(GTK_BOX(vbox), gbox, FALSE, FALSE, 0);
 	}
+	g_ptr_array_unref(gs);
 
 	g_signal_connect(ev, "button-press-event", G_CALLBACK(on_card_button_press), self);
 	return ev;
@@ -561,7 +629,21 @@ static gboolean conn_match_filter(Launcher* self, Conn* c)
 		return FALSE;
 	if (self->filter_mode == 2)
 	{
-		if (!self->filter_group || g_strcmp0(c->group, self->filter_group) != 0)
+		if (!self->filter_group)
+			return FALSE;
+		/* 连接可能属于多个分组（逗号分隔），任一分组命中即可 */
+		gboolean hit = FALSE;
+		GPtrArray* gs = group_split(c->group);
+		for (guint k = 0; k < gs->len; k++)
+		{
+			if (g_strcmp0(g_ptr_array_index(gs, k), self->filter_group) == 0)
+			{
+				hit = TRUE;
+				break;
+			}
+		}
+		g_ptr_array_unref(gs);
+		if (!hit)
 			return FALSE;
 	}
 
@@ -659,47 +741,55 @@ static void filter_bar_rebuild(Launcher* self)
 		gtk_widget_destroy(GTK_WIDGET(it->data));
 	g_list_free(children);
 
-	/* 收集去重分组 */
+	/* 收集去重分组（每个连接的 group 字段按逗号拆分） */
 	GPtrArray* groups = g_ptr_array_new_with_free_func(g_free);
 	for (guint i = 0; i < self->config->conns->len; i++)
 	{
 		Conn* c = g_ptr_array_index(self->config->conns, i);
-		if (!c->group || !*c->group)
-			continue;
-		gboolean dup = FALSE;
-		for (guint k = 0; k < groups->len; k++)
+		GPtrArray* gs = group_split(c->group);
+		for (guint m = 0; m < gs->len; m++)
 		{
-			if (g_strcmp0(g_ptr_array_index(groups, k), c->group) == 0)
+			const gchar* g = g_ptr_array_index(gs, m);
+			gboolean dup = FALSE;
+			for (guint k = 0; k < groups->len; k++)
 			{
-				dup = TRUE;
-				break;
+				if (g_strcmp0(g_ptr_array_index(groups, k), g) == 0)
+				{
+					dup = TRUE;
+					break;
+				}
 			}
+			if (!dup)
+				g_ptr_array_add(groups, g_strdup(g));
 		}
-		if (!dup)
-			g_ptr_array_add(groups, g_strdup(c->group));
+		g_ptr_array_unref(gs);
 	}
 
-	/* 当前分组若已不存在则回退到「全部」 */
-	if (self->filter_mode == 2 && self->filter_group)
-	{
-		gboolean found = FALSE;
-		for (guint k = 0; k < groups->len; k++)
-		{
-			if (g_strcmp0(g_ptr_array_index(groups, k), self->filter_group) == 0)
-			{
-				found = TRUE;
-				break;
-			}
-		}
-		if (!found)
-			self->filter_mode = 0;
-	}
-	if (self->filter_mode != 2)
-		self->filter_group = NULL;
+	/* 保存当前筛选分组名（旧数组即将释放，先复制出来避免悬空） */
+	gchar* keep_group = (self->filter_mode == 2 && self->filter_group)
+	                        ? g_strdup(self->filter_group)
+	                        : NULL;
 
 	if (self->groups)
 		g_ptr_array_unref(self->groups);
 	self->groups = groups;
+
+	/* 重新定位 filter_group 到新数组；分组已不存在则回退「全部」 */
+	self->filter_group = NULL;
+	if (keep_group)
+	{
+		for (guint k = 0; k < groups->len; k++)
+		{
+			if (g_strcmp0(g_ptr_array_index(groups, k), keep_group) == 0)
+			{
+				self->filter_group = g_ptr_array_index(groups, k);
+				break;
+			}
+		}
+		g_free(keep_group);
+		if (!self->filter_group)
+			self->filter_mode = 0;
+	}
 
 	/* 「全部」为组内第一个单选按钮 */
 	GtkWidget* c_all = chip_new("全部", 0, -1, NULL, self);
@@ -719,6 +809,10 @@ static void filter_bar_rebuild(Launcher* self)
 		gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(chip), active);
 		gtk_box_pack_start(GTK_BOX(self->filter_bar), chip, FALSE, FALSE, 0);
 	}
+
+	/* 新 chips 已被加入 filter_bar，但 filter_bar 在初始 show_all 后新增的子 widget
+	 * 不会自动显示，必须显式显示整条 filter_bar 才能让新 chips 可见。 */
+	gtk_widget_show_all(self->filter_bar);
 }
 
 static void on_search_changed(GtkSearchEntry* entry, gpointer data)
@@ -726,6 +820,40 @@ static void on_search_changed(GtkSearchEntry* entry, gpointer data)
 	(void)entry;
 	Launcher* self = data;
 	populate_grid(self);
+}
+
+/* 点击搜索图标：展开为搜索框并聚焦 */
+static void on_search_btn_clicked(GtkButton* btn, gpointer data)
+{
+	(void)btn;
+	Launcher* self = data;
+	gtk_widget_hide(self->search_btn);
+	gtk_widget_show(self->search);
+	gtk_widget_grab_focus(self->search);
+}
+
+/* 搜索框失去焦点：内容为空则收起回图标 */
+static gboolean on_search_focus_out(GtkWidget* entry, GdkEventFocus* ev, gpointer data)
+{
+	(void)ev;
+	Launcher* self = data;
+	const gchar* txt = gtk_entry_get_text(GTK_ENTRY(entry));
+	if (!txt || !*txt)
+	{
+		gtk_widget_hide(self->search);
+		gtk_widget_show(self->search_btn);
+	}
+	return FALSE;
+}
+
+/* 按 Esc 停止搜索：清空并收起 */
+static void on_search_stop(GtkSearchEntry* entry, gpointer data)
+{
+	(void)entry;
+	Launcher* self = data;
+	gtk_entry_set_text(GTK_ENTRY(self->search), "");
+	gtk_widget_hide(self->search);
+	gtk_widget_show(self->search_btn);
 }
 
 /* 选中态视觉反馈 */
@@ -887,6 +1015,7 @@ static gboolean conn_dialog(Launcher* self, Conn* c, GtkWindow* parent)
 	ADD_LABEL_ENTRY("密码", e_pass, is_new ? NULL : c->password);
 	gtk_entry_set_visibility(GTK_ENTRY(e_pass), FALSE);
 	ADD_LABEL_ENTRY("分组", e_group, is_new ? NULL : c->group);
+	gtk_entry_set_placeholder_text(GTK_ENTRY(e_group), "多个分组用英文逗号隔开，如：生产,办公");
 	ADD_LABEL_ENTRY("额外参数", e_extra, is_new ? NULL : c->extra);
 
 	c_full = gtk_check_button_new_with_label("全屏 (-f)");
@@ -1210,17 +1339,20 @@ static void on_activate(GtkApplication* app, gpointer data)
 	gtk_button_set_always_show_image(GTK_BUTTON(self->log_toggle), TRUE);
 	gtk_widget_set_sensitive(self->disconnect_btn, FALSE);
 
-	/* 搜索框（HeaderBar 内） */
+	/* 搜索：默认显示图标按钮，点击后展开为搜索框 */
 	self->search = gtk_search_entry_new();
 	gtk_widget_set_size_request(self->search, 240, -1);
 	gtk_entry_set_placeholder_text(GTK_ENTRY(self->search), "搜索名称或主机…");
+
+	self->search_btn = gtk_button_new_from_icon_name("system-search", GTK_ICON_SIZE_BUTTON);
+	gtk_widget_set_tooltip_text(self->search_btn, "搜索");
 
 	gtk_header_bar_pack_start(GTK_HEADER_BAR(header), b_new);
 	gtk_header_bar_pack_start(GTK_HEADER_BAR(header), b_edit);
 	gtk_header_bar_pack_start(GTK_HEADER_BAR(header), b_del);
 	gtk_header_bar_pack_end(GTK_HEADER_BAR(header), self->disconnect_btn);
 	gtk_header_bar_pack_end(GTK_HEADER_BAR(header), self->connect_btn);
-	gtk_header_bar_pack_end(GTK_HEADER_BAR(header), self->log_toggle);
+	gtk_header_bar_pack_end(GTK_HEADER_BAR(header), self->search_btn);
 	gtk_header_bar_pack_end(GTK_HEADER_BAR(header), self->search);
 
 	g_signal_connect(b_new, "clicked", G_CALLBACK(on_new), self);
@@ -1230,6 +1362,13 @@ static void on_activate(GtkApplication* app, gpointer data)
 	g_signal_connect(self->disconnect_btn, "clicked", G_CALLBACK(on_disconnect), self);
 	g_signal_connect(self->log_toggle, "toggled", G_CALLBACK(on_log_toggled), self);
 	g_signal_connect(self->search, "search-changed", G_CALLBACK(on_search_changed), self);
+	g_signal_connect(self->search_btn, "clicked", G_CALLBACK(on_search_btn_clicked), self);
+	g_signal_connect(self->search, "focus-out-event", G_CALLBACK(on_search_focus_out), self);
+	g_signal_connect(self->search, "stop-search", G_CALLBACK(on_search_stop), self);
+
+	/* 搜索框初始隐藏，仅显示图标按钮 */
+	gtk_widget_set_no_show_all(self->search, TRUE);
+	gtk_widget_hide(self->search);
 
 	/* ---------- 主体 ---------- */
 	GtkWidget* main_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
@@ -1311,10 +1450,18 @@ static void on_activate(GtkApplication* app, gpointer data)
 	gtk_box_pack_start(GTK_BOX(main_box), self->log_revealer, FALSE, FALSE, 0);
 
 	/* ---------- 底部状态栏 ---------- */
+	GtkWidget* statusbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+	gtk_style_context_add_class(gtk_widget_get_style_context(statusbar), "statusbar");
+
 	self->status = gtk_label_new("就绪");
 	gtk_widget_set_halign(self->status, GTK_ALIGN_START);
-	gtk_style_context_add_class(gtk_widget_get_style_context(self->status), "statusbar");
-	gtk_box_pack_start(GTK_BOX(main_box), self->status, FALSE, FALSE, 0);
+	gtk_widget_set_hexpand(self->status, TRUE);
+	gtk_box_pack_start(GTK_BOX(statusbar), self->status, TRUE, TRUE, 0);
+
+	/* 日志开关移到状态栏右侧，缓解 HeaderBar 右侧按钮拥挤 */
+	gtk_box_pack_end(GTK_BOX(statusbar), self->log_toggle, FALSE, FALSE, 0);
+
+	gtk_box_pack_start(GTK_BOX(main_box), statusbar, FALSE, FALSE, 0);
 
 	g_signal_connect(self->flow, "selected-children-changed", G_CALLBACK(on_card_selected), self);
 	g_signal_connect(win, "destroy", G_CALLBACK(on_window_destroy), self);
@@ -1344,9 +1491,11 @@ int main(int argc, char** argv)
 	Launcher* self = g_new0(Launcher, 1);
 	self->config = config_load();
 	const gchar* env = g_getenv("XFREERDP_BIN");
-	self->binary = g_strdup(env && *env ? env : "xfreerdp");
+	self->binary = g_strdup(env && *env ? env
+	                     : (self->config->rdp_bin ? self->config->rdp_bin : "xfreerdp"));
 	const gchar* rv = g_getenv("REMOTE_VIEWER_BIN");
-	self->spice_binary = g_strdup(rv && *rv ? rv : "remote-viewer");
+	self->spice_binary = g_strdup(rv && *rv ? rv
+	                      : (self->config->spice_bin ? self->config->spice_bin : "remote-viewer"));
 
 	g_signal_connect(app, "activate", G_CALLBACK(on_activate), self);
 
