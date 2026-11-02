@@ -3,6 +3,9 @@
 一个基于 GTK3 的轻量级远程桌面启动器，用卡片式界面管理 RDP 与 SPICE 连接，
 分别调用 `xfreerdp` 和 `remote-viewer` 建立会话。
 
+<img width="1091" height="763" alt="image" src="https://github.com/user-attachments/assets/9d3c2fbd-4673-4630-84d8-231b0177c2a7" />
+
+
 ## 1. 项目定位
 
 参照微软 Windows「远程桌面」Connection Center 的卡片式布局，提供：
